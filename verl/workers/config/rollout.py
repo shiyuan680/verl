@@ -140,6 +140,12 @@ class CheckpointEngineConfig(BaseConfig):
     # backend is instantiated, allowing custom backends to register themselves
     # in CheckpointEngineRegistry.
     custom_backend_module: Optional[str] = None
+    # Check the weight-update path once, before training starts: snapshot the
+    # rollout weights, reset them, push the trainer's weights through the real
+    # update path, then compare against the snapshot. Only meaningful while both
+    # sides hold the same freshly loaded weights, so a resumed run skips it.
+    # Off by default: a full pass hashes every weight on the host.
+    check_weight_update_equal: bool = False
 
 
 @dataclass

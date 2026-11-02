@@ -54,6 +54,7 @@ from verl.utils.profiler import (
 )
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.tracking import RLInsightLogger
+from verl.utils.weight_checksum import compare_checksums, merge_worker_checksums
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
@@ -181,6 +182,8 @@ class vLLMHttpServer:
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
         self._warned_missing_spec_decode_stats = False
+        # Digests recorded by check_weights("snapshot"); None until then.
+        self._weight_baseline: dict[str, str] | None = None
 
         # vLLM's pause stops requests being scheduled but still accepts them, and a request
         # admitted after the pause is invisible to the drain's liveness check.
@@ -994,6 +997,50 @@ class vLLMHttpServer:
             return
         await self.engine.wake_up(tags=["kv_cache"])
         await self.engine.reset_prefix_cache(reset_connector=True)
+
+    async def check_weights(self, action: str) -> dict | None:
+        """Run one weight-checker action against this replica's engine.
+
+        This drives the same engine-side checker behind vLLM's development
+        ``/weight_checker`` route, called in-process because verl owns the
+        ``AsyncLLM``. It is used to verify the weight-update path once, before
+        training starts: ``snapshot`` records the freshly loaded weights,
+        ``reset`` zeroes them, and ``compare`` checks that pushing the trainer's
+        weights restored the snapshot exactly.
+
+        Only the node-rank-0 actor owns an engine; the others return None so the
+        caller can tell "not applicable" from "passed".
+
+        Args:
+            action: One of ``snapshot``, ``reset`` or ``compare``.
+
+        Returns:
+            A dict with at least ``success``, or None on a headless actor.
+
+        Raises:
+            ValueError: If the action is unknown.
+        """
+        if self.node_rank != 0 or not hasattr(self, "engine"):
+            return None
+
+        if action == "snapshot":
+            self._weight_baseline = merge_worker_checksums(await self.engine.compute_weight_checksums())
+            return {"success": True, "num_keys": len(self._weight_baseline)}
+
+        if action == "reset":
+            # Same dispatch the dev route uses: every engine managed by this
+            # client resets its own workers.
+            await self.engine.collective_rpc("reset_weights")
+            return {"success": True}
+
+        if action == "compare":
+            if self._weight_baseline is None:
+                return {"success": False, "mismatches": [], "message": "compare without a snapshot"}
+            current = merge_worker_checksums(await self.engine.compute_weight_checksums())
+            matched, mismatches = compare_checksums(self._weight_baseline, current)
+            return {"success": matched, "mismatches": mismatches, "num_keys": len(current)}
+
+        raise ValueError(f"unknown weight-checker action: {action!r}")
 
     async def snapshot(self) -> dict[str, Any]:
         """Return live KV-cache and scheduler queue observations.

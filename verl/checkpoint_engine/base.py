@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -28,6 +29,8 @@ from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
+
+logger = logging.getLogger(__file__)
 
 
 @dataclass
@@ -560,6 +563,72 @@ class CheckpointEngineManager:
         await self.resume_generation_replicas()
 
         return sync_metrics
+
+    @auto_await
+    async def verify_update_path(self, global_steps: int = None) -> dict:
+        """Verify, once, that the weight-update path writes weights correctly.
+
+        Run this before training starts, while the trainer and the rollout
+        engines hold the same freshly loaded checkpoint: the engine's current
+        weights are then a known-good reference. Snapshot them, reset them,
+        push the trainer's weights through the path training uses, then compare.
+
+        The reset is what makes the check falsifiable. Without it, an update
+        that silently did nothing would compare equal, because the old weights
+        are still there.
+
+        It calls ``update_weights`` itself, so callers must not also push
+        weights for the same step.
+
+        Args:
+            global_steps: Passed through to ``update_weights``.
+
+        Returns:
+            How many replicas were checked.
+
+        Raises:
+            RuntimeError: If there is nothing to check, or any replica reports a
+                mismatch.
+        """
+        if not self.replicas:
+            raise RuntimeError("weight update check needs at least one rollout replica")
+
+        logger.info("Verifying the weight-update path on %d rollout replica(s)", len(self.replicas))
+        for replica in self.replicas:
+            await replica.check_weights("snapshot")
+        for replica in self.replicas:
+            await replica.check_weights("reset")
+
+        await self.update_weights(global_steps)
+
+        checked = 0
+        total_keys = 0
+        failures: list[dict] = []
+        for replica in self.replicas:
+            for result in await replica.check_weights("compare"):
+                checked += 1
+                total_keys += result.get("num_keys", 0)
+                if not result.get("success"):
+                    failures.append(result)
+
+        # A replica whose server owns no engine answers nothing, and a partial
+        # answer would silently leave those shards unverified while still
+        # looking like a pass. Every replica must contribute at least one result.
+        if checked < len(self.replicas):
+            raise RuntimeError(
+                f"weight update check covered {checked} of {len(self.replicas)} replica(s); "
+                "a replica reported no engine, so its weights were never verified"
+            )
+
+        if failures:
+            sample = failures[0].get("mismatches", [])[:5]
+            raise RuntimeError(
+                f"weight update check failed on {len(failures)} of {checked} replica(s); "
+                f"first mismatched keys: {sample}"
+            )
+
+        logger.info("Weight-update path verified: %d replica(s), %d weight shard(s) matched", checked, total_keys)
+        return {"replicas": checked, "num_keys": total_keys, "success": True}
 
 
 async def split_weight_chunks(
